@@ -12,7 +12,6 @@ from dashboard_data import VARIABLES, load_combined
 
 st.set_page_config(
     page_title="Kenya Climate & Vegetation Dashboard",
-    page_icon="\U0001f30d",
     layout="wide",
 )
 
