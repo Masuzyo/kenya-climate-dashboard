@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from dashboard_data import VARIABLES, load_combined
+from dashboard_data import PARQUET_CACHE, VARIABLES, load_combined
 
 st.set_page_config(
     page_title="Kenya Climate & Vegetation Dashboard",
@@ -18,7 +18,7 @@ st.set_page_config(
 st.title("\U0001f1f0\U0001f1ea Kenya Monthly Climate & Vegetation Dashboard")
 st.caption(
     "Sources: MODIS (max temperature, NDVI), CHIRPS (rainfall), "
-    "ERA5-Land (humidity, soil moisture) \u2014 5 km monthly grid."
+    "ERA5-Land (humidity, soil moisture)5 km monthly grid."
 )
 
 with st.sidebar:
@@ -110,6 +110,52 @@ trend_fig = px.line(
 trend_fig.add_vline(x=selected_month, line_dash="dash", line_color="red")
 trend_fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
 st.plotly_chart(trend_fig, width="stretch")
+
+
+# --- Download full dataset -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _read_parquet_bytes() -> bytes:
+    return PARQUET_CACHE.read_bytes()
+
+
+@st.cache_data(show_spinner=False)
+def _national_monthly_averages(df: pd.DataFrame) -> pd.DataFrame:
+    return df.groupby("month")[list(VARIABLES.keys())].mean().reset_index()
+
+
+st.subheader("Download data")
+dl_col1, dl_col2, dl_col3 = st.columns(3)
+
+with dl_col1:
+    st.markdown("**Full dataset (Parquet)**")
+    st.caption(f"All {len(months)} months \u00d7 all 6 variables, compact binary format.")
+    if PARQUET_CACHE.exists():
+        st.download_button(
+            "Download combined.parquet",
+            _read_parquet_bytes(),
+            file_name="kenya_climate_vegetation_all_months.parquet",
+            mime="application/octet-stream",
+        )
+    else:
+        st.info("Parquet cache not found on this server.")
+
+with dl_col2:
+    st.markdown("**Full dataset + code (ZIP)**")
+    st.caption("Every raw monthly CSV plus the ingest/dashboard source code, via GitHub.")
+    st.link_button(
+        "Download GitHub repo (.zip)",
+        "https://github.com/Masuzyo/kenya-climate-dashboard/archive/refs/heads/master.zip",
+    )
+
+with dl_col3:
+    st.markdown("**Monthly national averages (CSV)**")
+    st.caption("One row per month: Kenya-wide mean of every variable. Lightweight.")
+    st.download_button(
+        "Download monthly averages CSV",
+        _national_monthly_averages(df).to_csv(index=False),
+        file_name="kenya_monthly_national_averages.csv",
+        mime="text/csv",
+    )
 
 # --- Raw data / export -----------------------------------------------------
 with st.expander("Raw data (selected month)"):
