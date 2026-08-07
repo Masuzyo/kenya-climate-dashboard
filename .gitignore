@@ -2,11 +2,8 @@
 __pycache__/
 *.pyc
 
-# Raw per-month rasters/CSVs are regenerated locally by modis_kenya_monthly_ingest.py
-# and are too large / unnecessary to version. Only the compact parquet cache
-# (kenya_monthly_ingest/combined.parquet) built by dashboard_data.py is committed,
-# since that's all the deployed dashboard needs.
+# Raw per-month GeoTIFFs are regenerated locally by modis_kenya_monthly_ingest.py
+# and aren't needed by the dashboard (which only reads the CSVs / parquet cache).
 kenya_monthly_ingest/*.tif
-kenya_monthly_ingest/*.csv
 
 .streamlit/secrets.toml
