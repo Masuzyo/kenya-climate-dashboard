@@ -15,9 +15,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("\U0001f1f0\U0001f1ea Kenya Monthly Climate & Vegetation Dashboard")
-st.caption(
-    "Sources: MODIS (max temperature, NDVI), CHIRPS (rainfall), "
+st.title("Kenya Monthly Climate & Vegetation Dashboard")
+st.caption("Sources: MODIS (max temperature, NDVI), CHIRPS (rainfall), "
     "ERA5-Land (humidity, soil moisture)5 km monthly grid."
 )
 
@@ -50,16 +49,6 @@ with st.sidebar:
         value=len(months) - 1,
         format_func=lambda i: month_labels[i],
     )
-    map_style = st.radio(
-        "Map style",
-        ["Pixel grid (accurate)", "Smoothed density (approximate)"],
-        index=0,
-        help=(
-            "Pixel grid shows the true value at each 5 km cell. Smoothed "
-            "density applies a spatial kernel and can visually blur real "
-            "variation when points are as dense as this dataset."
-        ),
-    )
     st.markdown("---")
     st.caption(f"Dataset covers {month_labels[0]} \u2192 {month_labels[-1]} "
                f"({len(months)} months, {len(df):,} pixel-months).")
@@ -89,11 +78,8 @@ map_kwargs = dict(
     labels={variable: f"{meta['label']} ({meta['unit']})".strip()},
 )
 
-if map_style.startswith("Smoothed"):
-    fig = px.density_map(month_df, z=variable, radius=12, **map_kwargs)
-else:
-    fig = px.scatter_map(month_df, color=variable, **map_kwargs)
-    fig.update_traces(marker=dict(size=7, opacity=0.9))
+fig = px.scatter_map(month_df, color=variable, **map_kwargs)
+fig.update_traces(marker=dict(size=7, opacity=0.8))
 
 fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
 st.plotly_chart(fig, width="stretch")
