@@ -15,6 +15,21 @@ VARIABLES: dict[str, dict[str, str]] = {
         "unit": "\u00b0C",
         "colorscale": "Inferno",
     },
+    "min_temp_c": {
+        "label": "Min Temperature",
+        "unit": "\u00b0C",
+        "colorscale": "Cividis",
+    },
+    "mean_temp_c": {
+        "label": "Mean Temperature",
+        "unit": "\u00b0C",
+        "colorscale": "Magma",
+    },
+    "elevation_m": {
+        "label": "Elevation",
+        "unit": "m",
+        "colorscale": "Earth",
+    },
     "ndvi": {
         "label": "Vegetation Greenness (NDVI)",
         "unit": "",
@@ -79,7 +94,10 @@ def build_parquet_cache() -> Path:
     """
     df = _read_all_csv()
     for col in VARIABLES:
-        df[col] = df[col].astype("float32")
+        # Older CSVs may predate a variable added later (e.g. min_temp_c);
+        # skip gracefully instead of erroring on a missing column.
+        if col in df.columns:
+            df[col] = df[col].astype("float32")
     df["lat"] = df["lat"].astype("float32")
     df["lon"] = df["lon"].astype("float32")
     PARQUET_CACHE.parent.mkdir(parents=True, exist_ok=True)

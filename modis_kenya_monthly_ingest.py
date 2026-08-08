@@ -2,12 +2,13 @@
 
 DATA SOURCES
 ------------
-| Variable                              | EE collection                  | Band(s) used                                                          | Native resolution        | Native temporal coverage (rolling)          |
-|----------------------------------------|---------------------------------|------------------------------------------------------------------------|---------------------------|----------------------------------------------|
-| max_temp_c                             | MODIS/061/MOD11A2               | LST_Day_1km                                                             | 1 km, 8-day composite     | 2000-02-18 -> ~1-2 months behind today       |
-| ndvi, veg_cover_pct                     | MODIS/061/MOD13Q1               | NDVI                                                                    | 250 m, 16-day composite   | 2000-02-18 -> ~1-2 months behind today       |
-| rain_mm                                 | UCSB-CHG/CHIRPS/DAILY           | precipitation                                                           | ~5.5 km (0.05 deg), daily | 1981-01-01 -> ~1-2 months behind today       |
-| humidity_rh_pct, soil_moisture_m3m3     | ECMWF/ERA5_LAND/MONTHLY_AGGR    | temperature_2m, dewpoint_temperature_2m, volumetric_soil_water_layer_1  | ~11 km (0.1 deg), monthly | 1950-02-01 -> ~2-3 months behind today       |
+| Variable                                          | EE collection                  | Band(s) used                                                          | Native resolution        | Native temporal coverage (rolling)          |
+|-----------------------------------------------------|---------------------------------|------------------------------------------------------------------------|---------------------------|----------------------------------------------|
+| max_temp_c, min_temp_c, mean_temp_c                 | MODIS/061/MOD11A2               | LST_Day_1km, LST_Night_1km                                              | 1 km, 8-day composite     | 2000-02-18 -> ~1-2 months behind today       |
+| elevation_m                                         | USGS/SRTMGL1_003                | elevation                                                               | 30 m, static (no time dim)| n/a (single fixed snapshot, ~2000)           |
+| ndvi, veg_cover_pct                                 | MODIS/061/MOD13Q1               | NDVI                                                                    | 250 m, 16-day composite   | 2000-02-18 -> ~1-2 months behind today       |
+| rain_mm                                             | UCSB-CHG/CHIRPS/DAILY           | precipitation                                                           | ~5.5 km (0.05 deg), daily | 1981-01-01 -> ~1-2 months behind today       |
+| humidity_rh_pct, soil_moisture_m3m3                 | ECMWF/ERA5_LAND/MONTHLY_AGGR    | temperature_2m, dewpoint_temperature_2m, volumetric_soil_water_layer_1  | ~11 km (0.1 deg), monthly | 1950-02-01 -> ~2-3 months behind today       |
 
 Google's rolling end dates shift forward roughly monthly as each provider
 publishes; ERA5-Land is consistently the slowest to update, so it is the
@@ -16,11 +17,23 @@ binding constraint on how recent a month can be requested (see
 
 PER-MONTH AGGREGATION
 ----------------------
-- max_temp_c: MOD11A2 8-day LST composites overlapping the calendar month are
-  converted Kelvin -> Celsius (`value * 0.02 - 273.15`), then combined with a
-  per-pixel MAX across the ~3-4 composites/month that overlap (a composite is
-  included if any of its 8 days falls in the month, so edge composites can
-  pull in a day or two from the neighboring month).
+- max_temp_c: MOD11A2 8-day LST_Day_1km composites overlapping the calendar
+  month are converted Kelvin -> Celsius (`value * 0.02 - 273.15`), then
+  combined with a per-pixel MAX across the ~3-4 composites/month that overlap
+  (a composite is included if any of its 8 days falls in the month, so edge
+  composites can pull in a day or two from the neighboring month).
+- min_temp_c: same conversion applied to LST_Night_1km, combined with a
+  per-pixel MIN across the month's composites (coldest night of the month).
+  Night temperature is used as the monthly minimum since it's typically the
+  daily low; relevant because cold nights can halt mosquito survival /
+  parasite development even when daytime max temp looks warm enough.
+- mean_temp_c: average of each composite's day and night reading
+  (`(day + night) / 2`), then averaged again (MEAN) across the composites
+  overlapping the month. Not a native MODIS band.
+- elevation_m: SRTM 30 m DEM, used as-is (static -- no time filtering). The
+  same per-pixel value is included in every month's export for convenience.
+  Included because East African highland malaria transmission is strongly
+  bounded by altitude (largely via its effect on temperature).
 - ndvi: MOD13Q1 16-day NDVI composites overlapping the month, scaled by
   0.0001, combined with a per-pixel MEAN across the ~2 composites/month.
 - veg_cover_pct: derived from the monthly `ndvi` above via a standard linear
@@ -38,28 +51,30 @@ PER-MONTH AGGREGATION
 - soil_moisture_m3m3: ERA5-Land MONTHLY_AGGR `volumetric_soil_water_layer_1`
   (0-7 cm depth) used as-is; it is already a monthly mean in m3/m3.
 
-All six bands are combined, clipped to Kenya's boundary
+All nine bands are combined, clipped to Kenya's boundary
 (USDOS/LSIB_SIMPLE/2017), then `.unmask(NODATA_SENTINEL, sameFootprint=False)`
 so pixels with no valid data (outside Kenya, or missing from a source that
 month) are explicitly flagged rather than silently defaulting to 0.
 
 ACHIEVABLE TIME RANGE & RESOLUTION
 ------------------------------------
-- Longest span for ALL SIX variables together: ~2000-03 (first full calendar
+- Longest span for ALL variables together: ~2000-03 (first full calendar
   month after MODIS Terra data begins 2000-02-18) through ~2-3 months behind
   the current date (bounded by ERA5-Land MONTHLY_AGGR's publication lag).
   Rainfall alone (CHIRPS) could go back to 1981-01; MODIS-only variables
-  (max_temp_c, ndvi, veg_cover_pct) could start from 2000-02 if humidity/soil
-  moisture aren't needed.
+  (max_temp_c, min_temp_c, mean_temp_c, ndvi, veg_cover_pct) could start from
+  2000-02 if humidity/soil moisture aren't needed. elevation_m has no
+  temporal dimension (it's a single static snapshot from ~2000) so it never
+  constrains the range.
 - Finest native compositing period per source: MOD11A2 8-day, MOD13Q1 16-day,
   CHIRPS 1-day, ERA5-Land hourly natively (but MONTHLY_AGGR only exposes a
   monthly product). This script aggregates everything to MONTHLY. If a finer
-  common cadence were wanted across all six variables at once, MOD13Q1's
-  16-day cycle is the limiting factor (NDVI/veg_cover_pct cannot go finer
-  without interpolation). Individually, max_temp_c could go to 8-day, rain_mm
-  to daily, and humidity/soil_moisture to hourly or daily (by switching to
-  ECMWF/ERA5_LAND/HOURLY), but there is no shared cadence finer than 16 days
-  across the full variable set.
+  common cadence were wanted across all variables at once, MOD13Q1's 16-day
+  cycle is the limiting factor (NDVI/veg_cover_pct cannot go finer without
+  interpolation). Individually, the temperature bands could go to 8-day,
+  rain_mm to daily, and humidity/soil_moisture to hourly or daily (by
+  switching to ECMWF/ERA5_LAND/HOURLY), but there is no shared cadence finer
+  than 16 days across the full variable set.
 """
 
 import argparse
@@ -125,13 +140,45 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
     end = ee.Date(month_end.isoformat())
 
     # MODIS day land-surface temperature (8-day, Kelvin * 0.02) -> Celsius.
-    lst_c = (
+    lst_day_c_composites = (
         ee.ImageCollection("MODIS/061/MOD11A2")
         .filterDate(start, end)
         .select("LST_Day_1km")
         .map(lambda img: img.multiply(0.02).subtract(273.15))
-        .max()
-        .rename("max_temp_c")
+    )
+    max_temp_c = lst_day_c_composites.max().rename("max_temp_c")
+
+    # MODIS night land-surface temperature, same scaling. Used as a monthly
+    # MIN (coldest night of the month) since night temperature is usually the
+    # daily minimum, and cold nights can halt transmission of temperature-
+    # sensitive processes (e.g. mosquito survival, parasite development) even
+    # when daytime max temperature looks warm enough.
+    lst_night_c_composites = (
+        ee.ImageCollection("MODIS/061/MOD11A2")
+        .filterDate(start, end)
+        .select("LST_Night_1km")
+        .map(lambda img: img.multiply(0.02).subtract(273.15))
+    )
+    min_temp_c = lst_night_c_composites.min().rename("min_temp_c")
+
+    # Mean temperature: average of each composite's day/night reading, then
+    # averaged again across the composites overlapping the month.
+    mean_temp_c = (
+        lst_day_c_composites.mean()
+        .add(lst_night_c_composites.mean())
+        .divide(2)
+        .rename("mean_temp_c")
+    )
+
+    # Elevation (SRTM 30m, static/no time dimension). Included as a per-pixel
+    # constant in every monthly export for convenience; highland malaria in
+    # East Africa is strongly bounded by altitude via its effect on
+    # temperature, so this is a key covariate even though it never changes.
+    elevation_m = (
+        ee.Image("USGS/SRTMGL1_003")
+        .select("elevation")
+        .toFloat()  # native int16 can't represent the NaN NoData fill used downstream
+        .rename("elevation_m")
     )
 
     # MODIS NDVI (16-day, scale factor 0.0001).
@@ -192,7 +239,10 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
     )
 
     return (
-        lst_c.addBands(ndvi)
+        max_temp_c.addBands(min_temp_c)
+        .addBands(mean_temp_c)
+        .addBands(elevation_m)
+        .addBands(ndvi)
         .addBands(veg_cover)
         .addBands(rain)
         .addBands(rh)
@@ -250,8 +300,12 @@ def geotiff_to_csv(tif_path: Path, csv_path: Path, month: str) -> None:
         transform = src.transform
 
         # Prefer band descriptions written by GEE; fall back to positional names.
+        # Must match the addBands() order in monthly_stack().
         default_names = [
             "max_temp_c",
+            "min_temp_c",
+            "mean_temp_c",
+            "elevation_m",
             "ndvi",
             "veg_cover_pct",
             "rain_mm",
