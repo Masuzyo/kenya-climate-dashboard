@@ -5,10 +5,18 @@ Run with:
 """
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 import json
 import pathlib
+import statsmodels.api as sm
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Lasso
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.model_selection import KFold, GridSearchCV
 
 from dashboard_data import PARQUET_CACHE, VARIABLES, load_combined, county_monthly_averages
 
@@ -99,7 +107,7 @@ else:
     month_df = df[df["month"] == selected_month]
     county_month_df = county_df[county_df["month"] == selected_month]
 
-tab_climate, tab_malaria = st.tabs(["Climate & Vegetation", "Malaria Resistance"])
+tab_climate, tab_malaria, tab_modeling = st.tabs(["Climate & Vegetation", "Malaria Resistance", "Statistical Modeling"])
 
 with tab_climate:
     # --- KPI row -----------------------------------------------------------
@@ -364,3 +372,151 @@ with tab_malaria:
         )
     else:
         st.error("Simulated patient dataset not found. Please run simulate_patients.py first.")
+
+with tab_modeling:
+    st.subheader("Ecological Machine Learning & Statistical Modeling")
+    st.write("Modeling the association between standardized climatic variables and the proportion of simulated individuals carrying the HbAS malaria-protective allele.")
+    
+    model_choice = st.radio(
+        "Select Evaluation Model:",
+        options=["LASSO Regression (L1 Penalty)", "Random Forest (Exploratory)", "XGBoost (Exploratory)"],
+        horizontal=True
+    )
+    
+    if pdf is not None and not county_df.empty:
+        # 1. Aggregate pdf to get outcomes
+        county_table = pdf.groupby('county').agg(
+            n_resistant=('is_mutant', 'sum'),
+            n_tested=('patient_id', 'count')
+        ).reset_index()
+        
+        # 2. Get baseline climate
+        predictors = ['mean_temp_c', 'max_temp_c', 'min_temp_c', 'rain_mm', 'humidity_rh_pct', 'soil_moisture_m3m3', 'wind_u', 'wind_v', 'ndvi', 'elevation_m', 'urban_pct']
+        
+        # Check which predictors actually exist in the dataframe to avoid KeyErrors
+        available_predictors = [p for p in predictors if p in county_df.columns]
+        
+        baseline = county_df.groupby('county')[available_predictors].mean().reset_index()
+        
+        # 3. Merge
+        model_df = county_table.merge(baseline, on='county')
+        
+        # 4. Standardize predictors (z-scores)
+        for p in available_predictors:
+            model_df[f'z_{p}'] = (model_df[p] - model_df[p].mean()) / model_df[p].std()
+            
+        # 5. Prepare target and features
+        y = model_df['n_resistant'] / model_df['n_tested']
+        X_base = model_df[[f'z_{p}' for p in available_predictors]]
+        
+        # Add Interaction Terms (Degree 2)
+        poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+        X_poly = poly.fit_transform(X_base)
+        feature_names = poly.get_feature_names_out(X_base.columns)
+        X = pd.DataFrame(X_poly, columns=feature_names)
+        
+        if model_choice == "LASSO Regression (L1 Penalty)":
+            model_df['n_susceptible'] = model_df['n_tested'] - model_df['n_resistant']
+            endog = model_df[['n_resistant', 'n_susceptible']]
+            exog = sm.add_constant(X)
+            
+            # Custom 5-Fold CV for statsmodels GLM
+            alphas = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            kf = KFold(n_splits=5, shuffle=True, random_state=42)
+            best_alpha = alphas[0]
+            best_mse = float('inf')
+            
+            for alpha in alphas:
+                fold_mses = []
+                for train_idx, test_idx in kf.split(X):
+                    train_endog, test_endog = endog.iloc[train_idx], endog.iloc[test_idx]
+                    train_exog, test_exog = exog.iloc[train_idx], exog.iloc[test_idx]
+                    
+                    try:
+                        glm = sm.GLM(train_endog, train_exog, family=sm.families.Binomial())
+                        res = glm.fit_regularized(method='elastic_net', alpha=alpha, L1_wt=1.0)
+                        
+                        y_test_pred = res.predict(test_exog)
+                        y_test_true = test_endog['n_resistant'] / (test_endog['n_resistant'] + test_endog['n_susceptible'])
+                        fold_mse = mean_squared_error(y_test_true, y_test_pred)
+                        fold_mses.append(fold_mse)
+                    except Exception:
+                        fold_mses.append(float('inf'))
+                
+                avg_mse = np.mean(fold_mses)
+                if avg_mse < best_mse:
+                    best_mse = avg_mse
+                    best_alpha = alpha
+            
+            # Refit on all data with best alpha
+            glm = sm.GLM(endog, exog, family=sm.families.Binomial())
+            res = glm.fit_regularized(method='elastic_net', alpha=best_alpha, L1_wt=1.0)
+            
+            y_pred = res.predict(exog)
+            importances = res.params.drop('const', errors='ignore').values
+            title_prefix = "LASSO Coefficients (Logit Link)"
+            best_params_str = f"**Optimal Alpha:** {best_alpha}"
+        elif model_choice == "Random Forest (Exploratory)":
+            base_model = RandomForestRegressor(random_state=42)
+            param_grid = {'n_estimators': [50, 100, 200], 'max_depth': [None, 3, 5]}
+            grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+            grid_search.fit(X, y)
+            
+            model = grid_search.best_estimator_
+            y_pred = model.predict(X)
+            importances = model.feature_importances_
+            title_prefix = "Relative Feature Importance"
+            best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
+        else:
+            base_model = xgb.XGBRegressor(random_state=42, objective='reg:squarederror')
+            param_grid = {'n_estimators': [50, 100, 200], 'learning_rate': [0.01, 0.05, 0.1], 'max_depth': [3, 5]}
+            grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+            grid_search.fit(X, y)
+            
+            model = grid_search.best_estimator_
+            y_pred = model.predict(X)
+            importances = model.feature_importances_
+            title_prefix = "Relative Feature Importance"
+            best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
+            
+        r2 = r2_score(y, y_pred)
+        mse = mean_squared_error(y, y_pred)
+        
+        st.markdown(f"### {model_choice.split(' ')[0]} Performance Metrics")
+        st.info(f"**Optimal Hyperparameters (via 5-Fold CV):** {best_params_str}")
+        col1, col2 = st.columns(2)
+        col1.metric("Model R-squared ($R^2$)", f"{r2:.4f}")
+        col2.metric("Mean Squared Error (MSE)", f"{mse:.6f}")
+        
+        if model_choice == "LASSO Regression (L1 Penalty)":
+            st.markdown("### LASSO Coefficients (L1 Shrunk)")
+            st.info("Variables with a coefficient of exactly **0.0** were automatically discarded by the algorithm due to multicollinearity.")
+        else:
+            st.markdown(f"### Feature Importances")
+            
+        imp_df = pd.DataFrame({
+            'Predictor': feature_names,
+            'Importance': importances
+        })
+        
+        # For readability with 66+ interaction terms, keep only the top 20 by absolute magnitude
+        imp_df['Abs_Importance'] = imp_df['Importance'].abs()
+        imp_df = imp_df.sort_values(by='Abs_Importance', ascending=False).head(20)
+        imp_df = imp_df.sort_values(by='Abs_Importance', ascending=True)
+        
+        fig_imp = px.bar(
+            imp_df, 
+            x='Importance', 
+            y='Predictor', 
+            orientation='h',
+            title=f"{title_prefix} (Top 20)",
+            color='Importance',
+            color_continuous_scale="RdBu" if model_choice == "LASSO Regression (L1 Penalty)" else "Viridis"
+        )
+        if model_choice == "LASSO Regression (L1 Penalty)":
+            fig_imp.add_vline(x=0.0, line_width=2, line_color="black")
+            
+        st.plotly_chart(fig_imp, use_container_width=True)
+            
+    else:
+        st.error("Missing patient or climate data for modeling.")
