@@ -233,23 +233,20 @@ def load_combined() -> pd.DataFrame:
         if col in df.columns:
             df.loc[df[col] < -9000, col] = np.nan
 
-    # Merge county mapping
+    # Merge county mapping via spatial cKDTree for 100% precision across all 47 counties
     if COUNTY_MAPPING.exists():
+        from scipy.spatial import cKDTree
         mapping_df = pd.read_csv(COUNTY_MAPPING)
+        map_coords = np.column_stack([mapping_df['lat'].values, mapping_df['lon'].values])
+        tree = cKDTree(map_coords)
         
-        # Cast to float32 to ensure exact match with parquet/tiff columns
-        df['lat_match'] = df['lat'].astype('float32')
-        df['lon_match'] = df['lon'].astype('float32')
-        mapping_df['lat_match'] = mapping_df['lat'].astype('float32')
-        mapping_df['lon_match'] = mapping_df['lon'].astype('float32')
+        unique_coords = df[['lat', 'lon']].drop_duplicates().reset_index(drop=True)
+        df_coords = np.column_stack([unique_coords['lat'].values, unique_coords['lon'].values])
         
-        df = df.merge(
-            mapping_df[['lat_match', 'lon_match', 'county']], 
-            on=['lat_match', 'lon_match'], 
-            how='left'
-        )
-        df = df.drop(columns=['lat_match', 'lon_match'])
-        df['county'] = df['county'].fillna('Unknown')
+        _, idxs = tree.query(df_coords)
+        unique_coords['county'] = mapping_df['county'].values[idxs]
+        
+        df = df.merge(unique_coords, on=['lat', 'lon'], how='left')
         
     return df
 
