@@ -4,11 +4,13 @@ DATA SOURCES
 ------------
 | Variable                                          | EE collection                  | Band(s) used                                                          | Native resolution        | Native temporal coverage (rolling)          |
 |-----------------------------------------------------|---------------------------------|------------------------------------------------------------------------|---------------------------|----------------------------------------------|
-| max_temp_c, min_temp_c, mean_temp_c                 | MODIS/061/MOD11A2               | LST_Day_1km, LST_Night_1km                                              | 1 km, 8-day composite     | 2000-02-18 -> ~1-2 months behind today       |
+| max_temp_c, min_temp_c, mean_temp_c, dtr_c          | MODIS/061/MOD11A2               | LST_Day_1km, LST_Night_1km                                              | 1 km, 8-day composite     | 2000-02-18 -> ~1-2 months behind today       |
 | elevation_m                                         | USGS/SRTMGL1_003                | elevation                                                               | 30 m, static (no time dim)| n/a (single fixed snapshot, ~2000)           |
-| ndvi, veg_cover_pct                                 | MODIS/061/MOD13Q1               | NDVI                                                                    | 250 m, 16-day composite   | 2000-02-18 -> ~1-2 months behind today       |
+| ndvi, veg_cover_pct, evi                            | MODIS/061/MOD13Q1               | NDVI, EVI                                                               | 250 m, 16-day composite   | 2000-02-18 -> ~1-2 months behind today       |
+| forest, savanna, wetland, cropland, urban_pct       | MODIS/061/MCD12Q1               | LC_Type1                                                                | 500 m, annual composite   | 2000-01-01 -> 2023-12-31 (latest used for now)|
+| surface_water_occurrence_pct                        | JRC/GSW1_4/GlobalSurfaceWater   | occurrence                                                              | 30 m, static              | n/a (static occurrence probability)          |
 | rain_mm                                             | UCSB-CHG/CHIRPS/DAILY           | precipitation                                                           | ~5.5 km (0.05 deg), daily | 1981-01-01 -> ~1-2 months behind today       |
-| humidity_rh_pct, soil_moisture_m3m3                 | ECMWF/ERA5_LAND/MONTHLY_AGGR    | temperature_2m, dewpoint_temperature_2m, volumetric_soil_water_layer_1  | ~11 km (0.1 deg), monthly | 1950-02-01 -> ~2-3 months behind today       |
+| humidity_rh_pct, soil_moisture_m3m3, wind_speed_ms  | ECMWF/ERA5_LAND/MONTHLY_AGGR    | temperature_2m, dewpoint_temperature_2m, volumetric_soil_water_layer_1, u/v_component_of_wind_10m  | ~11 km (0.1 deg), monthly | 1950-02-01 -> ~2-3 months behind today       |
 
 Google's rolling end dates shift forward roughly monthly as each provider
 publishes; ERA5-Land is consistently the slowest to update, so it is the
@@ -30,16 +32,32 @@ PER-MONTH AGGREGATION
 - mean_temp_c: average of each composite's day and night reading
   (`(day + night) / 2`), then averaged again (MEAN) across the composites
   overlapping the month. Not a native MODIS band.
+- dtr_c: diurnal temperature range, derived as `max_temp_c - min_temp_c`.
+  Large DTR (> 15 °C) significantly slows Plasmodium parasite development
+  and reduces vector competence, even when mean temperature is in the
+  optimal 25-28 °C range. Highland Kenya has characteristically large DTR.
 - elevation_m: SRTM 30 m DEM, used as-is (static -- no time filtering). The
   same per-pixel value is included in every month's export for convenience.
   Included because East African highland malaria transmission is strongly
   bounded by altitude (largely via its effect on temperature).
 - ndvi: MOD13Q1 16-day NDVI composites overlapping the month, scaled by
   0.0001, combined with a per-pixel MEAN across the ~2 composites/month.
+- evi: MOD13Q1 16-day EVI composites overlapping the month, scaled by
+  0.0001, combined with a per-pixel MEAN. EVI is more sensitive than NDVI in
+  dense canopy (where NDVI saturates) and corrects for atmospheric and
+  soil-background effects; canopy structure affects mosquito resting
+  behaviour and microclimate.
 - veg_cover_pct: derived from the monthly `ndvi` above via a standard linear
   NDVI-to-fractional-vegetation-cover proxy (not a native MODIS product):
   `fCover = clamp((NDVI - 0.2) / (0.8 - 0.2), 0, 1) * 100`. NDVI<=0.2 reads as
   0% (bare soil/water); NDVI>=0.8 reads as 100% (full canopy).
+- forest_pct, savanna_pct, wetland_pct, cropland_pct, urban_pct: 
+  MODIS MCD12Q1 annual land cover, extracting fractions of IGBP classes
+  per export pixel. Since it's annual and ends in 2023, the most recent
+  available map prior to or during the current month is used.
+- surface_water_occurrence_pct: JRC Global Surface Water static occurrence
+  band (0-100%). Represents the frequency of water presence. Unmasked to 0
+  where water never occurs, averaged to the export pixel scale.
 - rain_mm: CHIRPS daily precipitation, SUMMED over every day in the calendar
   month -> total monthly rainfall in mm.
 - humidity_rh_pct: derived (not a direct ERA5-Land band) from ERA5-Land
@@ -50,8 +68,12 @@ PER-MONTH AGGREGATION
   temperatures; it is not derived from sub-monthly RH readings.
 - soil_moisture_m3m3: ERA5-Land MONTHLY_AGGR `volumetric_soil_water_layer_1`
   (0-7 cm depth) used as-is; it is already a monthly mean in m3/m3.
+- wind_speed_ms: derived from ERA5-Land MONTHLY_AGGR 10 m u- and v-wind
+  components as `sqrt(u² + v²)`. Wind speeds > 1.5-2 m/s significantly
+  reduce Anopheles host-seeking; regions with persistent trade winds
+  (coastal Kenya, Turkana corridor) may have lower transmission.
 
-All nine bands are combined, clipped to Kenya's boundary
+All eighteen bands are combined, clipped to Kenya's boundary
 (USDOS/LSIB_SIMPLE/2017), then `.unmask(NODATA_SENTINEL, sameFootprint=False)`
 so pixels with no valid data (outside Kenya, or missing from a source that
 month) are explicitly flagged rather than silently defaulting to 0.
@@ -130,7 +152,7 @@ def saturation_vapor_pressure_celsius(temp_c: ee.Image) -> ee.Image:
     )
 
 
-def monthly_stack(month_start: dt.date) -> ee.Image:
+def monthly_stack(month_start: dt.date, scale_m: int = 5000) -> ee.Image:
     month_end = (
         dt.date(month_start.year + (1 if month_start.month == 12 else 0), 1, 1)
         if month_start.month == 12
@@ -147,6 +169,10 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
         .map(lambda img: img.multiply(0.02).subtract(273.15))
     )
     max_temp_c = lst_day_c_composites.max().rename("max_temp_c")
+
+    # Diurnal temperature range: difference between monthly max daytime and
+    # min nighttime LST.  Large DTR (>15 °C) slows Plasmodium development
+    # and reduces vector competence even at favourable mean temperatures.
 
     # MODIS night land-surface temperature, same scaling. Used as a monthly
     # MIN (coldest night of the month) since night temperature is usually the
@@ -170,6 +196,9 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
         .rename("mean_temp_c")
     )
 
+    # Build DTR after both LST aggregates are available.
+    dtr_c = max_temp_c.subtract(min_temp_c).rename("dtr_c")
+
     # Elevation (SRTM 30m, static/no time dimension). Included as a per-pixel
     # constant in every monthly export for convenience; highland malaria in
     # East Africa is strongly bounded by altitude via its effect on
@@ -182,13 +211,28 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
     )
 
     # MODIS NDVI (16-day, scale factor 0.0001).
-    ndvi = (
+    mod13_collection = (
         ee.ImageCollection("MODIS/061/MOD13Q1")
         .filterDate(start, end)
+    )
+    ndvi = (
+        mod13_collection
         .select("NDVI")
         .map(lambda img: img.multiply(0.0001))
         .mean()
         .rename("ndvi")
+    )
+
+    # EVI: Enhanced Vegetation Index from the same MOD13Q1 collection.
+    # More sensitive than NDVI in dense canopy (where NDVI saturates) and
+    # corrects for atmospheric/soil-background effects; canopy structure
+    # affects mosquito resting behaviour and microclimate.
+    evi = (
+        mod13_collection
+        .select("EVI")
+        .map(lambda img: img.multiply(0.0001))
+        .mean()
+        .rename("evi")
     )
 
     # Monthly vegetation coverage proxy: fractional vegetation cover from NDVI.
@@ -198,6 +242,39 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
         .clamp(0, 1)
         .multiply(100)
         .rename("veg_cover_pct")
+    )
+
+    # Land Cover fractions (MODIS MCD12Q1, 500 m, annual)
+    # The collection ends in 2023. We get the latest available map prior to or during the current month.
+    lc = (
+        ee.ImageCollection("MODIS/061/MCD12Q1")
+        .filterDate("2000-01-01", end)
+        .sort("system:time_start", False)
+        .first()
+        .select("LC_Type1")
+    )
+
+    forest = lc.gte(1).And(lc.lte(5))
+    savanna = lc.gte(8).And(lc.lte(9))
+    wetland = lc.eq(11)
+    cropland = lc.eq(12).Or(lc.eq(14))
+    urban = lc.eq(13)
+
+    lc_fractions = (
+        ee.Image([forest, savanna, wetland, cropland, urban])
+        .rename(["forest_pct", "savanna_pct", "wetland_pct", "cropland_pct", "urban_pct"])
+        .multiply(100)
+        .reduceResolution(reducer=ee.Reducer.mean(), maxPixels=1024)
+        .reproject(crs="EPSG:4326", scale=scale_m)
+    )
+
+    # Surface Water (JRC Global Surface Water, 30 m, static)
+    # Using 'occurrence' band (0-100%) as a static map of water pooling propensity.
+    surface_water = (
+        ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+        .select("occurrence")
+        .unmask(0)
+        .rename("surface_water_occurrence_pct")
     )
 
     # Rainfall: CHIRPS daily precipitation summed monthly (mm/month).
@@ -238,15 +315,28 @@ def monthly_stack(month_start: dt.date) -> ee.Image:
         "soil_moisture_m3m3"
     )
 
+    # Wind speed: vector magnitude of 10 m u- and v-wind components.
+    # Wind > 1.5-2 m/s significantly reduces Anopheles host-seeking;
+    # persistent trade winds (coastal Kenya, Turkana corridor) may lower
+    # transmission beyond what temperature/humidity alone would predict.
+    u_wind = ee.Image(era5.select("u_component_of_wind_10m"))
+    v_wind = ee.Image(era5.select("v_component_of_wind_10m"))
+    wind_speed = u_wind.pow(2).add(v_wind.pow(2)).sqrt().rename("wind_speed_ms")
+
     return (
         max_temp_c.addBands(min_temp_c)
         .addBands(mean_temp_c)
+        .addBands(dtr_c)
         .addBands(elevation_m)
         .addBands(ndvi)
+        .addBands(evi)
         .addBands(veg_cover)
+        .addBands(lc_fractions)
+        .addBands(surface_water)
         .addBands(rain)
         .addBands(rh)
         .addBands(soil_moisture)
+        .addBands(wind_speed)
         .clip(kenya_geometry())
         # Explicitly flag masked/missing pixels (outside Kenya's polygon within
         # the export's bounding rectangle, or border edge effects between
@@ -305,12 +395,21 @@ def geotiff_to_csv(tif_path: Path, csv_path: Path, month: str) -> None:
             "max_temp_c",
             "min_temp_c",
             "mean_temp_c",
+            "dtr_c",
             "elevation_m",
             "ndvi",
+            "evi",
             "veg_cover_pct",
+            "forest_pct",
+            "savanna_pct",
+            "wetland_pct",
+            "cropland_pct",
+            "urban_pct",
+            "surface_water_occurrence_pct",
             "rain_mm",
             "humidity_rh_pct",
             "soil_moisture_m3m3",
+            "wind_speed_ms",
         ]
         band_names = [
             desc if desc else default_names[i]
@@ -374,7 +473,7 @@ def main() -> None:
     for month in months:
         month_label = month.strftime("%Y-%m")
         try:
-            image = monthly_stack(month)
+            image = monthly_stack(month, args.scale_m)
             out_file = output_dir / f"kenya_{month.strftime('%Y_%m')}.tif"
             print(f"Downloading {month_label} -> {out_file}")
             download_geotiff(image, out_file, args.scale_m)

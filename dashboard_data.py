@@ -6,6 +6,7 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).parent / "kenya_monthly_ingest"
 PARQUET_CACHE = DATA_DIR / "combined.parquet"
+COUNTY_MAPPING = DATA_DIR / "kenya_county_mapping.csv"
 
 # Metadata for each variable: display label, unit, and a Plotly colorscale
 # chosen to make sense for that quantity (e.g. green for vegetation).
@@ -25,6 +26,11 @@ VARIABLES: dict[str, dict[str, str]] = {
         "unit": "\u00b0C",
         "colorscale": "Magma",
     },
+    "dtr_c": {
+        "label": "Diurnal Temperature Range",
+        "unit": "\u00b0C",
+        "colorscale": "RdBu_r",
+    },
     "elevation_m": {
         "label": "Elevation",
         "unit": "m",
@@ -35,10 +41,45 @@ VARIABLES: dict[str, dict[str, str]] = {
         "unit": "",
         "colorscale": "RdYlGn",
     },
+    "evi": {
+        "label": "Enhanced Vegetation Index (EVI)",
+        "unit": "",
+        "colorscale": "YlGn",
+    },
     "veg_cover_pct": {
         "label": "Vegetation Coverage",
         "unit": "%",
         "colorscale": "Greens",
+    },
+    "forest_pct": {
+        "label": "Forest Cover",
+        "unit": "%",
+        "colorscale": "Greens",
+    },
+    "savanna_pct": {
+        "label": "Savanna Cover",
+        "unit": "%",
+        "colorscale": "YlOrBr",
+    },
+    "wetland_pct": {
+        "label": "Wetland Cover",
+        "unit": "%",
+        "colorscale": "Teal",
+    },
+    "cropland_pct": {
+        "label": "Cropland Cover",
+        "unit": "%",
+        "colorscale": "YlOrRd",
+    },
+    "urban_pct": {
+        "label": "Urban Cover",
+        "unit": "%",
+        "colorscale": "Reds",
+    },
+    "surface_water_occurrence_pct": {
+        "label": "Surface Water Occurrence",
+        "unit": "%",
+        "colorscale": "Blues",
     },
     "rain_mm": {
         "label": "Rainfall",
@@ -55,11 +96,19 @@ VARIABLES: dict[str, dict[str, str]] = {
         "unit": "m\u00b3/m\u00b3",
         "colorscale": "YlGnBu",
     },
+    "wind_speed_ms": {
+        "label": "Wind Speed (10 m)",
+        "unit": "m/s",
+        "colorscale": "Purples",
+    },
 }
 
 
 def _read_all_csv() -> pd.DataFrame:
     files = sorted(DATA_DIR.glob("kenya_*.csv"))
+    # Exclude the county mapping file which also matches the prefix
+    files = [f for f in files if "county_mapping" not in f.name]
+    
     if not files:
         raise FileNotFoundError(
             f"No CSV files found in {DATA_DIR}. Run modis_kenya_monthly_ingest.py "
@@ -82,8 +131,34 @@ def load_combined() -> pd.DataFrame:
     if PARQUET_CACHE.exists():
         df = pd.read_parquet(PARQUET_CACHE)
         df["month"] = pd.to_datetime(df["month"])
+
+        # Merge county mapping
+        if COUNTY_MAPPING.exists():
+            mapping_df = pd.read_csv(COUNTY_MAPPING)
+            
+            # Cast to float32 to ensure exact match with parquet columns
+            df['lat_match'] = df['lat'].astype('float32')
+            df['lon_match'] = df['lon'].astype('float32')
+            mapping_df['lat_match'] = mapping_df['lat'].astype('float32')
+            mapping_df['lon_match'] = mapping_df['lon'].astype('float32')
+            
+            df = df.merge(
+                mapping_df[['lat_match', 'lon_match', 'county']], 
+                on=['lat_match', 'lon_match'], 
+                how='left'
+            )
+            df = df.drop(columns=['lat_match', 'lon_match'])
+            df['county'] = df['county'].fillna('Unknown')
+            
         return df
     return _read_all_csv()
+
+
+def county_monthly_averages(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a lightweight dataframe grouped by month and county."""
+    if 'county' not in df.columns:
+        return df
+    return df.groupby(["month", "county"])[list(VARIABLES.keys())].mean().reset_index()
 
 
 def build_parquet_cache() -> Path:
