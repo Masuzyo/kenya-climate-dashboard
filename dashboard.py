@@ -137,7 +137,7 @@ with tab_climate:
             height=650,
             labels={variable: f"{meta['label']} ({meta['unit']})".strip()},
         )
-        fig = px.scatter_map(month_df, color=variable, **map_kwargs)
+        fig = px.scatter_map(month_df.dropna(subset=[variable]), color=variable, **map_kwargs)
         fig.update_traces(marker=dict(size=7, opacity=0.8))
     else:
         # County Choropleth Map

@@ -163,9 +163,12 @@ def read_tiff_file(tif_path: Path) -> pd.DataFrame:
                 df_dict[band_name] = data[idx].flatten().astype("float32")
                 
         df_tif = pd.DataFrame(df_dict)
-        # Filter out NoData sentinel values (-9999.0) outside the Kenya boundary polygon
+        # Filter out pixels outside the Kenya boundary polygon & replace band sentinels with NaN
         if "max_temp_c" in df_tif.columns:
             df_tif = df_tif[df_tif["max_temp_c"] > -9000].copy()
+        for col in TIFF_BAND_NAMES:
+            if col in df_tif.columns:
+                df_tif.loc[df_tif[col] < -9000, col] = np.nan
         return df_tif
 
 
@@ -224,6 +227,11 @@ def load_combined() -> pd.DataFrame:
         df["month"] = pd.to_datetime(df["month"])
     else:
         df = _read_raw_data()
+
+    # Clean any remaining NoData sentinels (< -9000) to NaN across all variables
+    for col in VARIABLES:
+        if col in df.columns:
+            df.loc[df[col] < -9000, col] = np.nan
 
     # Merge county mapping
     if COUNTY_MAPPING.exists():
