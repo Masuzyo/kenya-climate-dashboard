@@ -27,7 +27,7 @@ st.set_page_config(
 
 st.title("Kenya Monthly Climate & Vegetation Dashboard")
 st.caption("Sources: MODIS (temperature, NDVI, EVI, land cover), CHIRPS (rainfall), "
-    "ERA5-Land (humidity, soil moisture, wind speed), JRC (surface water) — 5 km monthly grid."
+    "ERA5-Land (humidity, soil moisture, wind speed), JRC (surface water) — 5 km monthly GeoTIFF rasters."
 )
 
 with st.sidebar:
@@ -236,7 +236,7 @@ with tab_climate:
 
     with dl_col2:
         st.markdown("**Full dataset + code (ZIP)**")
-        st.caption("Every raw CSV plus source code, via GitHub.")
+        st.caption("Every raw GeoTIFF raster (.tif) plus source code, via GitHub.")
         st.link_button(
             "Download GitHub repo (.zip)",
             "https://github.com/Masuzyo/kenya-climate-dashboard/archive/refs/heads/master.zip",
