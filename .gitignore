@@ -7,6 +7,7 @@ __pycache__/
 # Large raw raster and CSV dataset files (regenerated locally or pulled from Earth Engine)
 kenya_monthly_ingest/*.tif
 kenya_monthly_ingest/kenya_*.csv
+!kenya_monthly_ingest/kenya_county_mapping.csv
 kenya_monthly_ingest/_elevation_lookup.*
 
 # Ignore monolithic single parquet cache if >100MB

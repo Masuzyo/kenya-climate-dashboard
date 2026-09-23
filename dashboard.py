@@ -7,13 +7,18 @@ Run with:
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import json
 import pathlib
 import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson, jarque_bera
+from statsmodels.stats.diagnostic import het_breuschpagan
+from scipy import stats
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Lasso, LinearRegression
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.model_selection import KFold, GridSearchCV
@@ -373,150 +378,530 @@ with tab_malaria:
     else:
         st.error("Simulated patient dataset not found. Please run simulate_patients.py first.")
 
-with tab_modeling:
-    st.subheader("Ecological Machine Learning & Statistical Modeling")
-    st.write("Modeling the association between standardized climatic variables and the proportion of simulated individuals carrying the HbAS malaria-protective allele.")
-    
-    model_choice = st.radio(
-        "Select Evaluation Model:",
-        options=["LASSO Regression (L1 Penalty)", "Random Forest (Exploratory)", "XGBoost (Exploratory)"],
-        horizontal=True
-    )
-    
-    if pdf is not None and not county_df.empty:
-        # 1. Aggregate pdf to get outcomes
-        county_table = pdf.groupby('county').agg(
-            n_resistant=('is_mutant', 'sum'),
-            n_tested=('patient_id', 'count')
-        ).reset_index()
-        
-        # 2. Get baseline climate
-        predictors = ['mean_temp_c', 'max_temp_c', 'min_temp_c', 'rain_mm', 'humidity_rh_pct', 'soil_moisture_m3m3', 'wind_u', 'wind_v', 'ndvi', 'elevation_m', 'urban_pct']
-        
-        # Check which predictors actually exist in the dataframe to avoid KeyErrors
-        available_predictors = [p for p in predictors if p in county_df.columns]
-        
-        baseline = county_df.groupby('county')[available_predictors].mean().reset_index()
-        
-        # 3. Merge
-        model_df = county_table.merge(baseline, on='county')
-        
-        # 4. Standardize predictors (z-scores)
-        for p in available_predictors:
-            model_df[f'z_{p}'] = (model_df[p] - model_df[p].mean()) / model_df[p].std()
-            
-        # 5. Prepare target and features
-        y = model_df['n_resistant'] / model_df['n_tested']
-        X_base = model_df[[f'z_{p}' for p in available_predictors]]
-        
-        # Add Interaction Terms (Degree 2)
-        poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-        X_poly = poly.fit_transform(X_base)
-        feature_names = poly.get_feature_names_out(X_base.columns)
-        X = pd.DataFrame(X_poly, columns=feature_names)
-        
-        if model_choice == "LASSO Regression (L1 Penalty)":
-            model_df['n_susceptible'] = model_df['n_tested'] - model_df['n_resistant']
-            endog = model_df[['n_resistant', 'n_susceptible']]
-            exog = sm.add_constant(X)
-            
-            # Custom 5-Fold CV for statsmodels GLM
-            alphas = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
-            kf = KFold(n_splits=5, shuffle=True, random_state=42)
-            best_alpha = alphas[0]
-            best_mse = float('inf')
-            
-            for alpha in alphas:
-                fold_mses = []
-                for train_idx, test_idx in kf.split(X):
-                    train_endog, test_endog = endog.iloc[train_idx], endog.iloc[test_idx]
-                    train_exog, test_exog = exog.iloc[train_idx], exog.iloc[test_idx]
-                    
-                    try:
-                        glm = sm.GLM(train_endog, train_exog, family=sm.families.Binomial())
-                        res = glm.fit_regularized(method='elastic_net', alpha=alpha, L1_wt=1.0)
-                        
-                        y_test_pred = res.predict(test_exog)
-                        y_test_true = test_endog['n_resistant'] / (test_endog['n_resistant'] + test_endog['n_susceptible'])
-                        fold_mse = mean_squared_error(y_test_true, y_test_pred)
-                        fold_mses.append(fold_mse)
-                    except Exception:
-                        fold_mses.append(float('inf'))
-                
-                avg_mse = np.mean(fold_mses)
-                if avg_mse < best_mse:
-                    best_mse = avg_mse
-                    best_alpha = alpha
-            
-            # Refit on all data with best alpha
-            glm = sm.GLM(endog, exog, family=sm.families.Binomial())
-            res = glm.fit_regularized(method='elastic_net', alpha=best_alpha, L1_wt=1.0)
-            
-            y_pred = res.predict(exog)
-            importances = res.params.drop('const', errors='ignore').values
-            title_prefix = "LASSO Coefficients (Logit Link)"
-            best_params_str = f"**Optimal Alpha:** {best_alpha}"
-        elif model_choice == "Random Forest (Exploratory)":
-            base_model = RandomForestRegressor(random_state=42)
-            param_grid = {'n_estimators': [50, 100, 200], 'max_depth': [None, 3, 5]}
-            grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
-            grid_search.fit(X, y)
-            
-            model = grid_search.best_estimator_
-            y_pred = model.predict(X)
-            importances = model.feature_importances_
-            title_prefix = "Relative Feature Importance"
-            best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
-        else:
-            base_model = xgb.XGBRegressor(random_state=42, objective='reg:squarederror')
-            param_grid = {'n_estimators': [50, 100, 200], 'learning_rate': [0.01, 0.05, 0.1], 'max_depth': [3, 5]}
-            grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
-            grid_search.fit(X, y)
-            
-            model = grid_search.best_estimator_
-            y_pred = model.predict(X)
-            importances = model.feature_importances_
-            title_prefix = "Relative Feature Importance"
-            best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
-            
-        r2 = r2_score(y, y_pred)
-        mse = mean_squared_error(y, y_pred)
-        
-        st.markdown(f"### {model_choice.split(' ')[0]} Performance Metrics")
-        st.info(f"**Optimal Hyperparameters (via 5-Fold CV):** {best_params_str}")
-        col1, col2 = st.columns(2)
-        col1.metric("Model R-squared ($R^2$)", f"{r2:.4f}")
-        col2.metric("Mean Squared Error (MSE)", f"{mse:.6f}")
-        
-        if model_choice == "LASSO Regression (L1 Penalty)":
-            st.markdown("### LASSO Coefficients (L1 Shrunk)")
-            st.info("Variables with a coefficient of exactly **0.0** were automatically discarded by the algorithm due to multicollinearity.")
-        else:
-            st.markdown(f"### Feature Importances")
-            
-        imp_df = pd.DataFrame({
-            'Predictor': feature_names,
-            'Importance': importances
-        })
-        
-        # For readability with 66+ interaction terms, keep only the top 20 by absolute magnitude
-        imp_df['Abs_Importance'] = imp_df['Importance'].abs()
-        imp_df = imp_df.sort_values(by='Abs_Importance', ascending=False).head(20)
-        imp_df = imp_df.sort_values(by='Abs_Importance', ascending=True)
-        
-        fig_imp = px.bar(
-            imp_df, 
-            x='Importance', 
-            y='Predictor', 
-            orientation='h',
-            title=f"{title_prefix} (Top 20)",
-            color='Importance',
-            color_continuous_scale="RdBu" if model_choice == "LASSO Regression (L1 Penalty)" else "Viridis"
-        )
-        if model_choice == "LASSO Regression (L1 Penalty)":
-            fig_imp.add_vline(x=0.0, line_width=2, line_color="black")
-            
-        st.plotly_chart(fig_imp, use_container_width=True)
-            
+def make_gauss_markov_diagnostics(
+    fitted_vals: np.ndarray,
+    residuals: np.ndarray,
+    entity_labels: pd.Series | None = None,
+    title_prefix: str = "Gauss-Markov Residual Diagnostics",
+    max_scatter_points: int = 5000,
+) -> go.Figure:
+    n = len(residuals)
+    std_residuals = (residuals - np.mean(residuals)) / (np.std(residuals) + 1e-12)
+    sqrt_abs_std = np.sqrt(np.abs(std_residuals))
+
+    if n > max_scatter_points:
+        rng = np.random.default_rng(42)
+        sample_indices = rng.choice(n, size=max_scatter_points, replace=False)
     else:
-        st.error("Missing patient or climate data for modeling.")
+        sample_indices = np.arange(n)
+
+    fitted_s = fitted_vals[sample_indices]
+    resid_s = residuals[sample_indices]
+    std_resid_s = std_residuals[sample_indices]
+    sqrt_abs_std_s = sqrt_abs_std[sample_indices]
+
+    sorted_residuals = np.sort(std_resid_s)
+    n_sample = len(sorted_residuals)
+    theoretical_quantiles = stats.norm.ppf((np.arange(1, n_sample + 1) - 0.5) / n_sample)
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "1. Residuals vs. Fitted (Linearity & Drift)",
+            "2. Normal Q-Q Plot (Normality)",
+            "3. Scale-Location (Homoscedasticity)",
+            "4. Residuals by County (Spatial Heterogeneity)" if entity_labels is not None else "4. Residual Distribution",
+        ),
+        vertical_spacing=0.14,
+        horizontal_spacing=0.08,
+    )
+
+    # 1. Residuals vs Fitted
+    fig.add_trace(
+        go.Scatter(
+            x=fitted_s,
+            y=resid_s,
+            mode="markers",
+            marker=dict(color="#1f77b4", size=4, opacity=0.35),
+            name="Residuals",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[float(np.min(fitted_s)), float(np.max(fitted_s))],
+            y=[0.0, 0.0],
+            mode="lines",
+            line=dict(color="black", dash="dash", width=1.5),
+            name="Zero Reference",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    if len(fitted_s) > 10:
+        poly = np.poly1d(np.polyfit(fitted_s, resid_s, 2))
+        xs_curve = np.linspace(float(np.min(fitted_s)), float(np.max(fitted_s)), 100)
+        fig.add_trace(
+            go.Scatter(
+                x=xs_curve,
+                y=poly(xs_curve),
+                mode="lines",
+                line=dict(color="#d62728", width=2),
+                name="Fitted Trend",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+
+    # 2. Normal Q-Q Plot
+    fig.add_trace(
+        go.Scatter(
+            x=theoretical_quantiles,
+            y=sorted_residuals,
+            mode="markers",
+            marker=dict(color="#1f77b4", size=4, opacity=0.35),
+            name="Sample Quantiles",
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+    q_lim = max(abs(float(np.min(theoretical_quantiles))), abs(float(np.max(theoretical_quantiles))))
+    fig.add_trace(
+        go.Scatter(
+            x=[-q_lim, q_lim],
+            y=[-q_lim, q_lim],
+            mode="lines",
+            line=dict(color="#d62728", dash="dash", width=1.5),
+            name="Normal 45-deg Line",
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+
+    # 3. Scale-Location
+    fig.add_trace(
+        go.Scatter(
+            x=fitted_s,
+            y=sqrt_abs_std_s,
+            mode="markers",
+            marker=dict(color="#1f77b4", size=4, opacity=0.35),
+            name="Scale-Location",
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+    if len(fitted_s) > 10:
+        poly_sl = np.poly1d(np.polyfit(fitted_s, sqrt_abs_std_s, 2))
+        fig.add_trace(
+            go.Scatter(
+                x=xs_curve,
+                y=poly_sl(xs_curve),
+                mode="lines",
+                line=dict(color="#d62728", width=2),
+                name="Spread Trend",
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+
+    # 4. County Boxplot or Histogram
+    if entity_labels is not None:
+        plot_df = pd.DataFrame({"County": entity_labels, "Residual": residuals})
+        for c in sorted(plot_df["County"].unique()):
+            c_resid = plot_df[plot_df["County"] == c]["Residual"]
+            fig.add_trace(
+                go.Box(
+                    y=c_resid,
+                    name=c,
+                    showlegend=False,
+                    boxpoints=False,
+                    marker=dict(size=2),
+                ),
+                row=2,
+                col=2,
+            )
+    else:
+        fig.add_trace(
+            go.Histogram(
+                x=residuals,
+                nbinsx=40,
+                marker_color="#1f77b4",
+                showlegend=False,
+            ),
+            row=2,
+            col=2,
+        )
+
+    fig.update_xaxes(title_text="Fitted Values", row=1, col=1)
+    fig.update_yaxes(title_text="Residuals", row=1, col=1)
+    fig.update_xaxes(title_text="Theoretical Quantiles N(0, 1)", row=1, col=2)
+    fig.update_yaxes(title_text="Standardized Residuals", row=1, col=2)
+    fig.update_xaxes(title_text="Fitted Values", row=2, col=1)
+    fig.update_yaxes(title_text="sqrt(|Std Residuals|)", row=2, col=1)
+    if entity_labels is not None:
+        fig.update_xaxes(title_text="County", row=2, col=2, tickangle=45)
+        fig.update_yaxes(title_text="Residuals", row=2, col=2)
+    else:
+        fig.update_xaxes(title_text="Residual Value", row=2, col=2)
+        fig.update_yaxes(title_text="Count", row=2, col=2)
+
+    fig.update_layout(
+        title_text=title_prefix,
+        height=720,
+        margin=dict(l=40, r=20, t=50, b=50),
+    )
+    return fig
+
+
+with tab_modeling:
+    st.subheader("Statistical & Econometric Modeling Suite")
+    st.caption("Longitudinal panel econometrics (N = 13,464 county-months) and cross-sectional spatial epidemiology (N = 45 counties).")
+
+    domain_choice = st.radio(
+        "Select Analytical Domain:",
+        options=[
+            "Mode 1: Longitudinal Ecohydrological Panel (13,464 County-Months)",
+            "Mode 2: Spatial Epidemiology & Malaria Allele Resistance (45 Counties)",
+        ],
+        horizontal=True,
+    )
+
+    if domain_choice.startswith("Mode 1"):
+        st.markdown("#### Mode 1: Longitudinal Ecohydrological Panel Econometrics")
+        st.caption("Estimating dynamic interactions across 44 Kenyan counties over 306 monthly timesteps (2000–2026).")
+
+        m1_col1, m1_col2, m1_col3 = st.columns([1, 1, 1])
+        with m1_col1:
+            target_var = st.selectbox(
+                "Target Variable:",
+                options=["ndvi", "evi", "soil_moisture_m3m3", "veg_cover_pct"],
+                format_func=lambda v: f"{VARIABLES[v]['label']} ({v})",
+            )
+        with m1_col2:
+            panel_model_choice = st.selectbox(
+                "Econometric Specification:",
+                options=[
+                    "Pooled OLS (Benchmark)",
+                    "Entity Fixed Effects (Within Estimator)",
+                    "Two-Way Fixed Effects (TWFE: Entity + Month + Year)",
+                    "Random Forest Regressor (Nonlinear Panel)",
+                ],
+            )
+        with m1_col3:
+            include_ar1 = st.checkbox("Include Autoregressive Lag-1 (y_{t-1})", value=True)
+
+        candidate_covars = [v for v in VARIABLES.keys() if v != target_var and v not in ["elevation_m"]]
+        default_covars = [v for v in ["rain_mm", "mean_temp_c", "soil_moisture_m3m3", "humidity_rh_pct", "wind_speed_ms"] if v in candidate_covars]
+        selected_covars = st.multiselect("Predictor Covariates:", options=candidate_covars, default=default_covars)
+
+        if not selected_covars and not include_ar1:
+            st.warning("Please select at least one predictor covariate or enable the autoregressive lag.")
+        else:
+            panel_work = county_df.sort_values(["county", "month"]).reset_index(drop=True).copy()
+            covars_used = list(selected_covars)
+            if include_ar1:
+                panel_work["target_lag1"] = panel_work.groupby("county")[target_var].shift(1)
+                covars_used.append("target_lag1")
+
+            panel_clean = panel_work.dropna(subset=[target_var] + covars_used).copy()
+
+            if panel_model_choice == "Pooled OLS (Benchmark)":
+                X = sm.add_constant(panel_clean[covars_used])
+                y = panel_clean[target_var]
+                res = sm.OLS(y, X).fit()
+                y_pred = res.fittedvalues.values
+                residuals = res.resid.values
+                r2 = res.rsquared
+                r2_adj = res.rsquared_adj
+                r2_within = None
+                param_df = pd.DataFrame({
+                    "Covariate": res.params.index,
+                    "Coefficient": res.params.values,
+                    "Std Error": res.bse.values,
+                    "t-statistic": res.tvalues.values,
+                    "p-value": res.pvalues.values,
+                    "CI Lower (95%)": res.conf_int()[0].values,
+                    "CI Upper (95%)": res.conf_int()[1].values,
+                })
+
+            elif panel_model_choice == "Entity Fixed Effects (Within Estimator)":
+                county_dummies = pd.get_dummies(panel_clean["county"], prefix="county", drop_first=True, dtype=float)
+                X = pd.concat([sm.add_constant(panel_clean[covars_used]), county_dummies], axis=1)
+                y = panel_clean[target_var]
+                res = sm.OLS(y, X).fit()
+                y_pred = res.fittedvalues.values
+                residuals = res.resid.values
+                r2 = res.rsquared
+                r2_adj = res.rsquared_adj
+                y_within_dev = panel_clean.groupby("county")[target_var].transform(lambda s: s - s.mean())
+                ss_tot_within = np.sum(y_within_dev ** 2)
+                ss_res_within = np.sum(residuals ** 2)
+                r2_within = 1.0 - (ss_res_within / (ss_tot_within + 1e-12))
+                structural_cols = ["const"] + covars_used
+                param_df = pd.DataFrame({
+                    "Covariate": structural_cols,
+                    "Coefficient": res.params[structural_cols].values,
+                    "Std Error": res.bse[structural_cols].values,
+                    "t-statistic": res.tvalues[structural_cols].values,
+                    "p-value": res.pvalues[structural_cols].values,
+                    "CI Lower (95%)": res.conf_int().loc[structural_cols, 0].values,
+                    "CI Upper (95%)": res.conf_int().loc[structural_cols, 1].values,
+                })
+
+            elif panel_model_choice == "Two-Way Fixed Effects (TWFE: Entity + Month + Year)":
+                county_dummies = pd.get_dummies(panel_clean["county"], prefix="county", drop_first=True, dtype=float)
+                month_dummies = pd.get_dummies(panel_clean["month"].dt.month, prefix="mo", drop_first=True, dtype=float)
+                year_dummies = pd.get_dummies(panel_clean["month"].dt.year, prefix="yr", drop_first=True, dtype=float)
+                X = pd.concat([sm.add_constant(panel_clean[covars_used]), county_dummies, month_dummies, year_dummies], axis=1)
+                y = panel_clean[target_var]
+                res = sm.OLS(y, X).fit()
+                y_pred = res.fittedvalues.values
+                residuals = res.resid.values
+                r2 = res.rsquared
+                r2_adj = res.rsquared_adj
+                y_within_dev = panel_clean.groupby("county")[target_var].transform(lambda s: s - s.mean())
+                ss_tot_within = np.sum(y_within_dev ** 2)
+                ss_res_within = np.sum(residuals ** 2)
+                r2_within = 1.0 - (ss_res_within / (ss_tot_within + 1e-12))
+                structural_cols = ["const"] + covars_used
+                param_df = pd.DataFrame({
+                    "Covariate": structural_cols,
+                    "Coefficient": res.params[structural_cols].values,
+                    "Std Error": res.bse[structural_cols].values,
+                    "t-statistic": res.tvalues[structural_cols].values,
+                    "p-value": res.pvalues[structural_cols].values,
+                    "CI Lower (95%)": res.conf_int().loc[structural_cols, 0].values,
+                    "CI Upper (95%)": res.conf_int().loc[structural_cols, 1].values,
+                })
+
+            else:  # Random Forest Regressor
+                X = panel_clean[covars_used]
+                y = panel_clean[target_var]
+                rf = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
+                rf.fit(X, y)
+                y_pred = rf.predict(X)
+                residuals = y.values - y_pred
+                r2 = r2_score(y, y_pred)
+                r2_adj = 1.0 - (1.0 - r2) * (len(y) - 1) / (len(y) - X.shape[1] - 1)
+                r2_within = None
+                param_df = None
+                imp_df = pd.DataFrame({"Predictor": covars_used, "Importance": rf.feature_importances_}).sort_values(by="Importance", ascending=True)
+
+            st.markdown("### Model Performance Metrics")
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            m_col1.metric("Overall R-squared", f"{r2:.4f}")
+            if r2_within is not None:
+                m_col2.metric("Within R-squared", f"{r2_within:.4f}")
+            else:
+                m_col2.metric("Adjusted R-squared", f"{r2_adj:.4f}")
+            resid_std = float(np.std(residuals))
+            m_col3.metric("Residual Std Dev (σ_ε)", f"{resid_std:.4f}")
+            dw_val = float(durbin_watson(residuals))
+            m_col4.metric("Durbin-Watson", f"{dw_val:.3f}")
+
+            jb_stat, jb_p, skew, kurt = jarque_bera(residuals)
+            if panel_model_choice != "Random Forest Regressor (Nonlinear Panel)":
+                bp_lm, bp_p, _, _ = het_breuschpagan(residuals, sm.add_constant(panel_clean[covars_used]))
+                st.info(
+                    f"**Formal Econometric Diagnostics:**  \n"
+                    f"• **Durbin-Watson Stat:** DW = {dw_val:.3f} ({'Absence of first-order serial correlation' if dw_val >= 1.7 else 'Positive temporal persistence detected'})  \n"
+                    f"• **Jarque-Bera Normality Test:** Stat = {jb_stat:.1f} (p = {jb_p:.2e}, Skewness = {skew:.2f}, Kurtosis = {kurt:.2f})  \n"
+                    f"• **Breusch-Pagan Homoscedasticity Test:** LM Stat = {bp_lm:.1f} (p = {bp_p:.2e})"
+                )
+            else:
+                st.info(
+                    f"**Random Forest Residual Diagnostics:**  \n"
+                    f"• **Durbin-Watson Stat:** DW = {dw_val:.3f}  \n"
+                    f"• **Jarque-Bera Normality Test:** Stat = {jb_stat:.1f} (p = {jb_p:.2e}, Skewness = {skew:.2f}, Kurtosis = {kurt:.2f})"
+                )
+
+            if param_df is not None:
+                st.markdown("### Structural Parameter Estimates")
+                st.dataframe(
+                    param_df.round(4),
+                    column_config={
+                        "Covariate": "Covariate",
+                        "Coefficient": st.column_config.NumberColumn("Coefficient (β)", format="%.4f"),
+                        "Std Error": st.column_config.NumberColumn("Std Error", format="%.4f"),
+                        "t-statistic": st.column_config.NumberColumn("t-statistic", format="%.2f"),
+                        "p-value": st.column_config.NumberColumn("p-value", format="%.4f"),
+                        "CI Lower (95%)": st.column_config.NumberColumn("CI Lower (95%)", format="%.4f"),
+                        "CI Upper (95%)": st.column_config.NumberColumn("CI Upper (95%)", format="%.4f"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.markdown("### Random Forest Feature Importance")
+                fig_rf = px.bar(
+                    imp_df,
+                    x="Importance",
+                    y="Predictor",
+                    orientation="h",
+                    title="MDI Feature Importances",
+                    color="Importance",
+                    color_continuous_scale="Viridis",
+                )
+                st.plotly_chart(fig_rf, use_container_width=True)
+
+            st.markdown("### Gauss-Markov Residual Diagnostics Suite")
+            diag_fig = make_gauss_markov_diagnostics(
+                fitted_vals=y_pred,
+                residuals=residuals,
+                entity_labels=panel_clean["county"],
+                title_prefix=f"Residual Diagnostics: {panel_model_choice} (N = {len(panel_clean):,})",
+            )
+            st.plotly_chart(diag_fig, use_container_width=True)
+
+    else:
+        st.markdown("#### Mode 2: Spatial Epidemiology & Malaria Allele Resistance")
+        st.caption("Cross-sectional ecological modeling of county-level HbAS sickle-cell trait prevalence (N = 45 counties).")
+
+        epi_model_choice = st.radio(
+            "Select Evaluation Model:",
+            options=[
+                "LASSO Regression (L1 Penalty)",
+                "Ordinary Least Squares (OLS) with Diagnostics",
+                "Random Forest (Exploratory)",
+                "XGBoost (Exploratory)",
+            ],
+            horizontal=True,
+        )
+
+        if pdf is not None and not county_df.empty:
+            county_table = pdf.groupby('county').agg(
+                n_resistant=('is_mutant', 'sum'),
+                n_tested=('patient_id', 'count')
+            ).reset_index()
+
+            predictors = ['mean_temp_c', 'max_temp_c', 'min_temp_c', 'rain_mm', 'humidity_rh_pct', 'soil_moisture_m3m3', 'ndvi', 'elevation_m', 'urban_pct']
+            available_predictors = [p for p in predictors if p in county_df.columns]
+            baseline = county_df.groupby('county')[available_predictors].mean().reset_index()
+            model_df = county_table.merge(baseline, on='county')
+
+            for p in available_predictors:
+                model_df[f'z_{p}'] = (model_df[p] - model_df[p].mean()) / (model_df[p].std() + 1e-12)
+
+            y = model_df['n_resistant'] / model_df['n_tested']
+            X_base = model_df[[f'z_{p}' for p in available_predictors]]
+
+            poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+            X_poly = poly.fit_transform(X_base)
+            feature_names = poly.get_feature_names_out(X_base.columns)
+            X = pd.DataFrame(X_poly, columns=feature_names)
+
+            if epi_model_choice == "LASSO Regression (L1 Penalty)":
+                model_df['n_susceptible'] = model_df['n_tested'] - model_df['n_resistant']
+                endog = model_df[['n_resistant', 'n_susceptible']]
+                exog = sm.add_constant(X)
+
+                alphas = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+                kf = KFold(n_splits=5, shuffle=True, random_state=42)
+                best_alpha = alphas[0]
+                best_mse = float('inf')
+
+                for alpha in alphas:
+                    fold_mses = []
+                    for train_idx, test_idx in kf.split(X):
+                        train_endog, test_endog = endog.iloc[train_idx], endog.iloc[test_idx]
+                        train_exog, test_exog = exog.iloc[train_idx], exog.iloc[test_idx]
+                        try:
+                            glm = sm.GLM(train_endog, train_exog, family=sm.families.Binomial())
+                            res = glm.fit_regularized(method='elastic_net', alpha=alpha, L1_wt=1.0)
+                            y_test_pred = res.predict(test_exog)
+                            y_test_true = test_endog['n_resistant'] / (test_endog['n_resistant'] + test_endog['n_susceptible'])
+                            fold_mses.append(mean_squared_error(y_test_true, y_test_pred))
+                        except Exception:
+                            fold_mses.append(float('inf'))
+                    avg_mse = np.mean(fold_mses)
+                    if avg_mse < best_mse:
+                        best_mse = avg_mse
+                        best_alpha = alpha
+
+                glm = sm.GLM(endog, exog, family=sm.families.Binomial())
+                res = glm.fit_regularized(method='elastic_net', alpha=best_alpha, L1_wt=1.0)
+                y_pred = res.predict(exog)
+                importances = res.params.drop('const', errors='ignore').values
+                title_prefix = "LASSO Coefficients (Logit Link)"
+                best_params_str = f"**Optimal Alpha:** {best_alpha}"
+
+            elif epi_model_choice == "Ordinary Least Squares (OLS) with Diagnostics":
+                X_ols = sm.add_constant(X_base)
+                res_ols = sm.OLS(y, X_ols).fit()
+                y_pred = res_ols.fittedvalues.values
+                residuals_ols = res_ols.resid.values
+                importances = res_ols.params.drop('const', errors='ignore').values
+                feature_names = X_base.columns
+                title_prefix = "OLS Standardized Coefficients"
+                best_params_str = "Standard Unpenalized OLS"
+
+            elif epi_model_choice == "Random Forest (Exploratory)":
+                base_model = RandomForestRegressor(random_state=42)
+                param_grid = {'n_estimators': [50, 100, 200], 'max_depth': [None, 3, 5]}
+                grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+                grid_search.fit(X, y)
+                model = grid_search.best_estimator_
+                y_pred = model.predict(X)
+                importances = model.feature_importances_
+                title_prefix = "Relative Feature Importance"
+                best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
+
+            else:
+                base_model = xgb.XGBRegressor(random_state=42, objective='reg:squarederror')
+                param_grid = {'n_estimators': [50, 100, 200], 'learning_rate': [0.01, 0.05, 0.1], 'max_depth': [3, 5]}
+                grid_search = GridSearchCV(base_model, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+                grid_search.fit(X, y)
+                model = grid_search.best_estimator_
+                y_pred = model.predict(X)
+                importances = model.feature_importances_
+                title_prefix = "Relative Feature Importance"
+                best_params_str = ", ".join([f"**{k}:** {v}" for k, v in grid_search.best_params_.items()])
+
+            r2 = r2_score(y, y_pred)
+            mse = mean_squared_error(y, y_pred)
+
+            st.markdown(f"### {epi_model_choice.split(' ')[0]} Performance Metrics")
+            st.info(f"**Hyperparameter Specification:** {best_params_str}")
+            col1, col2 = st.columns(2)
+            col1.metric("Model R-squared (R²)", f"{r2:.4f}")
+            col2.metric("Mean Squared Error (MSE)", f"{mse:.6f}")
+
+            imp_df = pd.DataFrame({'Predictor': feature_names, 'Importance': importances})
+            imp_df['Abs_Importance'] = imp_df['Importance'].abs()
+            imp_df = imp_df.sort_values(by='Abs_Importance', ascending=False).head(20)
+            imp_df = imp_df.sort_values(by='Abs_Importance', ascending=True)
+
+            fig_imp = px.bar(
+                imp_df,
+                x='Importance',
+                y='Predictor',
+                orientation='h',
+                title=f"{title_prefix} (Top 20)",
+                color='Importance',
+                color_continuous_scale="RdBu" if "LASSO" in epi_model_choice or "OLS" in epi_model_choice else "Viridis",
+            )
+            if "LASSO" in epi_model_choice or "OLS" in epi_model_choice:
+                fig_imp.add_vline(x=0.0, line_width=2, line_color="black")
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+            if epi_model_choice == "Ordinary Least Squares (OLS) with Diagnostics":
+                st.markdown("### Gauss-Markov Residual Diagnostics Suite")
+                ols_diag_fig = make_gauss_markov_diagnostics(
+                    fitted_vals=y_pred,
+                    residuals=residuals_ols,
+                    entity_labels=None,
+                    title_prefix="OLS Gauss-Markov Residual Diagnostics (N = 45 Counties)",
+                )
+                st.plotly_chart(ols_diag_fig, use_container_width=True)
+
+        else:
+            st.error("Missing simulated patient or climate data for spatial modeling.")

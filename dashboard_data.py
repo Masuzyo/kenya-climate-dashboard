@@ -133,6 +133,28 @@ VARIABLES: dict[str, dict[str, str]] = {
 }
 
 
+PHYSICAL_RANGES: dict[str, tuple[float, float]] = {
+    "max_temp_c": (-20.0, 65.0),
+    "min_temp_c": (-20.0, 65.0),
+    "mean_temp_c": (-20.0, 65.0),
+    "dtr_c": (0.0, 50.0),
+    "elevation_m": (-500.0, 9000.0),
+    "ndvi": (-0.2, 1.0),
+    "evi": (-0.2, 1.0),
+    "veg_cover_pct": (0.0, 100.0),
+    "forest_pct": (0.0, 100.0),
+    "savanna_pct": (0.0, 100.0),
+    "wetland_pct": (0.0, 100.0),
+    "cropland_pct": (0.0, 100.0),
+    "urban_pct": (0.0, 100.0),
+    "surface_water_occurrence_pct": (0.0, 100.0),
+    "rain_mm": (0.0, 3000.0),
+    "humidity_rh_pct": (0.0, 100.0),
+    "soil_moisture_m3m3": (0.0, 1.0),
+    "wind_speed_ms": (0.0, 100.0),
+}
+
+
 def read_tiff_file(tif_path: Path) -> pd.DataFrame:
     """Extract georeferenced spatial coordinates and 18 variable bands from a GeoTIFF raster."""
     if not HAS_RASTERIO:
@@ -247,16 +269,49 @@ def load_combined() -> pd.DataFrame:
         unique_coords['county'] = mapping_df['county'].values[idxs]
         
         df = df.merge(unique_coords, on=['lat', 'lon'], how='left')
+
+    # Mask nodata fill values outside physical boundaries
+    for col, (vmin, vmax) in PHYSICAL_RANGES.items():
+        if col in df.columns:
+            vals = df[col].values
+            mask = (vals < vmin) | (vals > vmax)
+            if np.any(mask):
+                df.loc[mask, col] = np.nan
         
     return df
 
 
 def county_monthly_averages(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a lightweight dataframe grouped by month and county."""
+    """Return a lightweight dataframe grouped by month and county with physical range filtering and linear interpolation."""
     if 'county' not in df.columns:
         return df
-    available_vars = [v for v in VARIABLES.keys() if v in df.columns]
-    return df.groupby(["month", "county"])[available_vars].mean().reset_index()
+
+    # Filter out Unknown / non-county coordinates
+    sub_df = df[df['county'] != 'Unknown'].copy()
+    available_vars = [v for v in VARIABLES.keys() if v in sub_df.columns]
+
+    # Ensure physical limits
+    for col in available_vars:
+        if col in PHYSICAL_RANGES:
+            vmin, vmax = PHYSICAL_RANGES[col]
+            vals = sub_df[col].values
+            mask = (vals < vmin) | (vals > vmax)
+            if np.any(mask):
+                sub_df.loc[mask, col] = np.nan
+
+    # Group by month and county
+    agg = sub_df.groupby(["month", "county"])[available_vars].mean().reset_index()
+
+    # Sort chronologically by county and month
+    agg = agg.sort_values(["county", "month"]).reset_index(drop=True)
+
+    # Impute isolated temporal gaps (e.g. cloud-covered LST in Lake Victoria basin) via linear interpolation
+    for col in available_vars:
+        agg[col] = agg.groupby("county")[col].transform(
+            lambda s: s.interpolate(method="linear", limit_direction="both")
+        )
+
+    return agg
 
 
 def build_parquet_cache(num_chunks: int = 4) -> list[Path]:
