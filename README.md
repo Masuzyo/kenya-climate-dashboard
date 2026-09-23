@@ -22,7 +22,8 @@ ERA5-Land humidity/soil moisture).
 - `dashboard_data.py` — loads the combined dataset. Prefers the compact
   `kenya_monthly_ingest/combined.parquet` cache (committed to git) over the
   raw per-month CSVs (gitignored — regenerate locally as needed).
-- `dashboard.py` — the Streamlit app (map, variable/month controls, trends).
+- `dashboard.py` — the Streamlit app (map, variable/month controls, trends, and econometric suite).
+- `models.ipynb` — full econometric and ML modeling notebook (Pooled OLS, Fixed Effects, TWFE, dynamic autoregressive panel, Gauss-Markov diagnostics, and spatial epidemiology).
 
 ## Running locally
 
